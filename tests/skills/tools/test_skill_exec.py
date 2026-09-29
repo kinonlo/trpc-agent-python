@@ -17,10 +17,14 @@ from trpc_agent_sdk.skills.tools._skill_exec import PollSessionTool
 from trpc_agent_sdk.skills.tools._skill_exec import SkillExecTool
 from trpc_agent_sdk.skills.tools._skill_exec import WriteStdinTool
 from trpc_agent_sdk.skills.tools._skill_exec import _close_session
+from trpc_agent_sdk.skills.tools._skill_exec import _collect_final_result
 from trpc_agent_sdk.skills.tools._skill_exec import _detect_interaction
+from trpc_agent_sdk.skills.tools._skill_exec import _ExecSession
 from trpc_agent_sdk.skills.tools._skill_exec import _has_selection_items
 from trpc_agent_sdk.skills.tools._skill_exec import _last_non_empty_line
+from trpc_agent_sdk.skills.tools._skill_exec import _start_session
 from trpc_agent_sdk.skills.tools._skill_exec import create_exec_tools
+from trpc_agent_sdk.skills.tools._skill_run import SkillRunFile
 
 
 def _make_exec_tool() -> SkillExecTool:
@@ -107,3 +111,102 @@ class TestCloseSession:
         sess.proc.close = AsyncMock()
         await _close_session(sess)
         sess.proc.close.assert_awaited_once()
+
+
+class TestStartSession:
+    @pytest.mark.asyncio
+    async def test_start_session_stores_workspace_runtime(self):
+        workspace_runtime = MagicMock(name="workspace_runtime")
+        ws = MagicMock(name="ws")
+        proc = MagicMock(name="proc")
+        runner = MagicMock()
+        runner.start_program = AsyncMock(return_value=proc)
+        inputs = ExecInput(skill="s", command="echo hi")
+
+        session = await _start_session(
+            runner=runner,
+            tool_context=MagicMock(),
+            inputs=inputs,
+            ws=ws,
+            workspace_runtime=workspace_runtime,
+            rel_cwd="skills/s",
+            env={"A": "1"},
+        )
+
+        assert isinstance(session, _ExecSession)
+        assert session.workspace_runtime is workspace_runtime
+        assert session.ws is ws
+        assert session.proc is proc
+        assert session.in_data is inputs
+
+
+class TestCollectFinalResult:
+    """Regression coverage for issue #350.
+
+    ``_prepare_outputs`` requires ``workspace_runtime``.  A plain ``AsyncMock``
+    swallows the missing-argument ``TypeError``, so the collection path silently
+    degrades to empty files.  These tests bind a signature-strict stub so a
+    dropped argument fails the assertions instead of being absorbed.
+    """
+
+    def _make_session(self, workspace_runtime, in_data=None):
+        proc = MagicMock()
+        proc.run_result = AsyncMock(return_value=MagicMock(stdout="done\n", stderr="", exit_code=0))
+        return _ExecSession(
+            proc=proc,
+            ws=MagicMock(name="ws"),
+            workspace_runtime=workspace_runtime,
+            in_data=in_data or ExecInput(skill="s", command="echo hi", output_files=["out/result.txt"]),
+        )
+
+    @pytest.mark.asyncio
+    async def test_collect_final_result_passes_workspace_runtime_and_files(self):
+        workspace_runtime = MagicMock(name="workspace_runtime")
+        session = self._make_session(workspace_runtime)
+        expected_files = [SkillRunFile(
+            name="out/result.txt",
+            content="ok",
+            mime_type="text/plain",
+            size_bytes=2,
+        )]
+
+        async def _prepare_outputs(ctx, ws, runtime, input_data):
+            # Signature-strict: a missing argument raises TypeError here and
+            # the production `except Exception` would degrade to empty files.
+            assert runtime is workspace_runtime
+            assert input_data.output_files == ["out/result.txt"]
+            return list(expected_files), None
+
+        run_tool = MagicMock()
+        run_tool._prepare_outputs = AsyncMock(side_effect=_prepare_outputs)
+        run_tool._attach_artifacts_if_requested = AsyncMock()
+        run_tool._merge_manifest_artifact_refs = MagicMock()
+
+        ctx = MagicMock()
+        result = await _collect_final_result(ctx, session, run_tool)
+
+        assert result is not None
+        assert result.exit_code == 0
+        assert result.output_files == expected_files
+        assert result.primary_output is not None
+        assert result.primary_output.name == "out/result.txt"
+        assert session.finalized is True
+        assert session.final_result is result
+
+        run_tool._prepare_outputs.assert_awaited_once()
+        call_args = run_tool._prepare_outputs.await_args.args
+        assert call_args == (ctx, session.ws, workspace_runtime, call_args[3])
+
+    @pytest.mark.asyncio
+    async def test_collect_final_result_returns_cached_when_finalized(self):
+        session = self._make_session(MagicMock())
+        cached = MagicMock(name="cached")
+        session.finalized = True
+        session.final_result = cached
+
+        run_tool = MagicMock()
+        run_tool._prepare_outputs = AsyncMock()
+
+        result = await _collect_final_result(MagicMock(), session, run_tool)
+        assert result is cached
+        run_tool._prepare_outputs.assert_not_awaited()
