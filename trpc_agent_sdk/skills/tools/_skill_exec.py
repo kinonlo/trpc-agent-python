@@ -91,6 +91,8 @@ from ._file_stager import SkillStageRequest
 from ._skill_run import SkillRunInput
 from ._skill_run import SkillRunOutput
 from ._skill_run import SkillRunTool
+from ._skill_run import _WARN_STDERR_TRUNCATED
+from ._skill_run import _WARN_STDOUT_TRUNCATED
 from ._skill_run import _filter_failed_empty_outputs
 from ._skill_run import _select_primary_output
 from ._skill_run import _truncate_output
@@ -782,36 +784,56 @@ async def _collect_final_result(
         inputs=in_data.inputs,
         outputs=in_data.outputs,
     )
+    warnings: list[str] = []
     try:
         files, manifest = await run_tool._prepare_outputs(ctx, exec_session.ws, exec_session.workspace_runtime,
                                                           fake_run_input)
     except Exception as ex:  # pylint: disable=broad-except
         logger.warning("skill_exec: collect outputs failed: %s", ex)
         files, manifest = [], None
+        warnings.append(f"output collection failed: {ex}")
 
+    timed_out = False
+    duration_ms = 0
     try:
         run_result = await exec_session.proc.run_result()
-        total_out = (run_result.stdout or "") + (run_result.stderr or "")
+        stdout_raw = run_result.stdout or ""
+        stderr_raw = run_result.stderr or ""
         exit_code = run_result.exit_code
+        timed_out = bool(getattr(run_result, "timed_out", False))
+        duration_ms = int((getattr(run_result, "duration", 0) or 0) * 1000)
     except Exception:  # pylint: disable=broad-except
-        run_log = await exec_session.proc.log(None, None)
-        total_out = run_log.output or ""
-        exit_code = exec_session.exit_code or 0
+        try:
+            run_log = await exec_session.proc.log(None, None)
+            stdout_raw = run_log.output or ""
+        except Exception:  # pylint: disable=broad-except
+            stdout_raw = ""
+        stderr_raw = ""
+        if exec_session.exit_code is not None:
+            exit_code = exec_session.exit_code
+        else:
+            exit_code = 0
+            warnings.append("exit code unavailable after run_result failure; reported as 0")
 
     # Reuse the same output-quality helpers as skill_run
-    warnings: list[str] = []
-    stdout, trunc = _truncate_output(total_out)
+    stdout, trunc = _truncate_output(stdout_raw)
     if trunc:
-        warnings.append("stdout truncated")
+        warnings.append(_WARN_STDOUT_TRUNCATED)
+    stderr, trunc = _truncate_output(stderr_raw)
+    if trunc:
+        warnings.append(_WARN_STDERR_TRUNCATED)
 
-    files, filter_warns = _filter_failed_empty_outputs(exit_code, False, files)
+    files, filter_warns = _filter_failed_empty_outputs(exit_code, timed_out, files)
     warnings.extend(filter_warns)
 
     primary = _select_primary_output(files)
 
     result = SkillRunOutput(
         stdout=stdout,
+        stderr=stderr,
         exit_code=exit_code,
+        timed_out=timed_out,
+        duration_ms=duration_ms,
         output_files=files,
         primary_output=primary,
         warnings=warnings,
@@ -824,6 +846,13 @@ async def _collect_final_result(
 
     if manifest:
         run_tool._merge_manifest_artifact_refs(manifest, result)
+
+    # omit_inline_content: keep metadata only, match skill_run contract
+    if in_data.omit_inline_content:
+        for f in result.output_files:
+            f.content = ""
+        if result.primary_output:
+            result.primary_output.content = ""
 
     exec_session.final_result = result
     exec_session.finalized = True
