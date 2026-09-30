@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from trpc_agent_sdk.context import reset_invocation_ctx
+from trpc_agent_sdk.context import set_invocation_ctx
 from trpc_agent_sdk.skills._dynamic_toolset import SkillToolSetWithDynamicTools
 from trpc_agent_sdk.skills._toolset import SkillToolSet
 
@@ -72,6 +76,65 @@ class TestSkillToolSetGetTools:
         ctx = _make_ctx()
         await ts.get_tools(ctx)
         ctx.agent_context.with_metadata.assert_called()
+
+
+@pytest.mark.parametrize("toolset_cls", [SkillToolSet, SkillToolSetWithDynamicTools])
+class TestSkillToolSetFiltering:
+
+    async def test_name_filter_on_first_and_cached_calls(self, tmp_path, toolset_cls):
+        allowed = ["skill_load", "skill_list", "workspace_exec"]
+        ts = toolset_cls(paths=[str(tmp_path)], tool_filter=allowed, is_include_all_tools=False)
+
+        for _ in range(2):
+            tools = await ts.get_tools(_make_ctx())
+            assert {tool.name for tool in tools} == set(allowed)
+            assert len(tools) == len(allowed)
+
+    async def test_predicate_uses_current_context_without_filtering_cache(self, tmp_path, toolset_cls):
+        calls = []
+
+        def predicate(tool, ctx):
+            calls.append((tool.name, ctx))
+            return tool.name in ctx.allowed_tools
+
+        ts = toolset_cls(paths=[str(tmp_path)], tool_filter=predicate, is_include_all_tools=False)
+        for allowed in (set(), {"skill_run"}, {"skill_load"}):
+            ctx = _make_ctx()
+            ctx.allowed_tools = allowed
+            calls.clear()
+            tools = await ts.get_tools(ctx)
+            assert {tool.name for tool in tools} == allowed
+            assert calls
+            assert all(call_ctx is ctx for _, call_ctx in calls)
+
+    async def test_predicate_receives_implicit_context(self, tmp_path, toolset_cls):
+        predicate = MagicMock(side_effect=lambda tool, ctx: tool.name == "skill_load")
+        ts = toolset_cls(paths=[str(tmp_path)], tool_filter=predicate, is_include_all_tools=False)
+        ctx = _make_ctx()
+        token = set_invocation_ctx(ctx)
+        try:
+            for _ in range(2):
+                predicate.reset_mock()
+                tools = await ts.get_tools()
+                assert [tool.name for tool in tools] == ["skill_load"]
+                assert predicate.called
+                assert all(call.args[1] is ctx for call in predicate.call_args_list)
+        finally:
+            reset_invocation_ctx(token)
+
+    @pytest.mark.parametrize("tool_filter,is_include_all_tools", [
+        (None, False),
+        ([], False),
+        (["skill_load"], True),
+        (lambda tool, ctx: False, True),
+    ])
+    async def test_unfiltered_behavior_is_preserved(self, tmp_path, toolset_cls, tool_filter, is_include_all_tools):
+        ts = toolset_cls(paths=[str(tmp_path)], tool_filter=tool_filter, is_include_all_tools=is_include_all_tools)
+        first = [tool.name for tool in await ts.get_tools(_make_ctx())]
+        second = [tool.name for tool in await ts.get_tools(_make_ctx())]
+        assert {"skill_load", "skill_run", "skill_exec", "workspace_exec", "skill_list"} <= set(first)
+        assert first == second
+        assert len(first) == len(set(first))
 
 
 class TestSkillToolSetWithDynamicTools:
